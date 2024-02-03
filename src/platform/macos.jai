@@ -34,7 +34,7 @@ platform_create_window :: inline () {
 }
 
 platform_maximize_window :: inline (window: Window_Type) {
-    NSWindow.toggleFullScreen(window, window);
+    NSWindow.maximize(window);
 }
 
 platform_enable_drag_and_drop :: inline (window: Window_Type) {
@@ -51,19 +51,31 @@ platform_set_window_title :: inline (title: string) {
 }
 
 platform_wait_message :: inline () {
-
+    Input.macos_wait_for_event();
 }
 
 platform_wake_up_main_thread :: () {
-    // TODO
+    nsev := NSEvent.otherEventWithType(
+        type = NSEventTypeApplicationDefined,
+        location = .{},
+        modifierFlags = 0,
+        timestamp = 0,
+        windowNumber = 0,
+        ctx = null,
+        subtype = 0,
+        data1 = 0,
+        data2 = 0);
+    NSApplication.postEvent(NSApp, nsev, YES);
 }
 
 platform_set_refresh_timer :: inline (window: Window_Type) {
-
+    destroy_timer(platform_timer);
+    platform_timer = create_timer(50, true);
 }
 
 platform_kill_refresh_timer :: inline (window: Window_Type) {
-
+    destroy_timer(platform_timer);
+    platform_timer = null;
 }
 
 platform_enumerate_logical_drives :: inline () -> [] string {
@@ -123,3 +135,66 @@ monitors : [..] Monitor;
 #import "Objective_C";
 #import "Objective_C/AppKit";
 #import "Process";
+#import "Hash_Table";
+
+// We need to store the association between `Focus_Timer` instances and `NSTimer` instances externally
+// since currently we can't properly do instance variables for Cocoa classes (see the warning at the
+// top of `modules/Objective_C/module.jai` for more details). Granted this platform layer only ever
+// uses a single timer but I've implemented the "generic" way in case we ever want to move this
+// implementation to some macOS support module (similar to how `Linux_Display` works).
+//
+//  - @ileonte 23.01.2024
+//
+native_timers: Table(*Focus_Timer, *NSTimer);
+platform_timer: *Focus_Timer;
+
+timer_class_registered := false;
+Focus_Timer :: struct {
+    using #as base: NSObject;
+
+    timerFired :: (using self: *Focus_Timer, _sel: Selector, notification: *NSNotification) #c_call {
+        event := NSEvent.otherEventWithType(
+            type = NSEventTypeApplicationDefined,
+            location = .{},
+            modifierFlags = 0,
+            timestamp = 0,
+            windowNumber = 0,
+            ctx = null,
+            subtype = 0,
+            data1 = 0,
+            data2 = 0);
+        NSApplication.postEvent(NSApp, event, YES);
+    } @selector(timerFired:)
+}
+
+create_timer :: (timeout_ms: u64, repeat := true) -> *Focus_Timer {
+    if !timer_class_registered {
+        timer_class_registered = true;
+        init(*native_timers);
+
+        cls := objc_create_class(Focus_Timer, NSObject);
+        objc_add_instance_method(cls, Focus_Timer.timerFired, "timerFired:");
+        objc_finalize_class(cls);
+    }
+    ret := objc_new(Focus_Timer);
+    ns_timer := NSTimer.scheduledTimerWithTimeInterval(
+        interval = cast(float64)timeout_ms * 0.01,
+        target = ret,
+        selector = selector("timerFired:"),
+        userInfo = null,
+        repeats = YES);
+    table_add(*native_timers, ret, ns_timer);
+    NSRunLoop.addTimer(NSRunLoop.currentRunLoop(), ns_timer, NSRunLoopCommonModes);
+    return ret;
+}
+
+destroy_timer :: (timer: *Focus_Timer) {
+    if (timer) {
+        ns_timer, found := table_find(*native_timers, timer);
+        if found {
+            NSTimer.invalidate(ns_timer);
+            table_remove(*native_timers, timer);
+        }
+        release(timer);
+    }
+}

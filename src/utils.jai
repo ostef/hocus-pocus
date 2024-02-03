@@ -5,14 +5,12 @@ array_insert_bytes_at :: (array: *[..] u8, offset: s64, bytes: [] u8) {
     new_size := array.count + bytes.count;
     array_reserve(array, new_size);
 
-    // NOTE: assuming memcpy works well with overlapping ranges!
-    // (tested on Windows with all backends)
     src := array.data + offset;
     dst := src + bytes.count;
-    memcpy(dst, src, array.count - offset);
+    focus_memcpy(dst, src, array.count - offset);
 
     // Insert the string
-    memcpy(array.data + offset, bytes.data, bytes.count);
+    focus_memcpy(array.data + offset, bytes.data, bytes.count);
 
     array.count = new_size;
 }
@@ -23,14 +21,14 @@ array_add_bytes :: (array: *[..] u8, bytes: [] u8) {
     new_size := array.count + bytes.count;
     array_reserve(array, new_size);
 
-    memcpy(array.data + array.count, bytes.data, bytes.count);
+    focus_memcpy(array.data + array.count, bytes.data, bytes.count);
 
     array.count = new_size;
 }
 
 array_delete_bytes :: (array: *[..] u8, offset: s64, count: s64) {
     assert(offset >= 0 && count >= 0 && offset + count <= array.count);
-    memcpy(array.data + offset, array.data + offset + count, array.count - offset - count);
+    focus_memcpy(array.data + offset, array.data + offset + count, array.count - offset - count);
     array.count -= count;
 }
 
@@ -47,26 +45,6 @@ arrays_concat :: (array1: [] $T, array2: [] T) -> [] T {
     array_extend(*result, array1);
     array_extend(*result, array2);
     return result;
-}
-
-decode_utf8_string_to_temp_char_substrings :: (str: string) -> [] string {
-    substrings: [..] string;
-    substrings.allocator = temp;
-
-    if !str return substrings;
-
-    array_reserve(*substrings, str.count);
-
-    t := str.data;
-    while t < str.data + str.count {
-        substr: string = ---;
-        substr.data = t;
-        t = unicode_next_character(t);
-        substr.count = t - substr.data;
-        array_add(*substrings, substr);
-    }
-
-    return substrings;
 }
 
 maybe_free_and_clear :: (str: *string) {
@@ -92,7 +70,7 @@ array_extend :: (array: *[..] $T, slice: [] T) {
     new_size := array.count + slice.count;
     array_reserve(array, new_size);
 
-    memcpy(array.data + array.count, slice.data, slice.count * size_of(T));
+    focus_memcpy(array.data + array.count, slice.data, slice.count * size_of(T));
 
     array.count = new_size;
 }
@@ -129,6 +107,15 @@ slice_chars :: (str: string, pos1: s32, pos2: s32) -> string {
     return slice(str, offset1, offset2 - offset1);
 }
 
+advance_to_next_line :: inline (s: *string) {
+    while s.* {
+        saw_newline := s.*[0] == #char "\n";
+        s.count -= 1;
+        s.data  += 1;
+        if saw_newline break;  // only break after the newline, not before
+    }
+}
+
 // @Speed: this is even slower than the standard find_index_from_left
 // NOTE: this function assumes that the substring contains only word chars,
 // otherwise it doesn't make sense to call it
@@ -162,27 +149,106 @@ find_index_from_left_whole_word :: (s: string, substring: string, start_index :=
     return -1;
 }
 
-fuzzy_match :: (str: string, chars: [] string) -> score: s32, highlights: [] bool {
-    highlights := NewArray(str.count, bool, initialized = true);  // allocates from the pool
-                                                                  // we "leak" if there's no match but that should be ok
-    if !chars return 0, highlights;
+fuzzy_match :: (str: string, filter: Fuzzy_Filter, only_exact := false) -> score: s32, highlights: [] bool, exact_match := false {
+    highlights := NewArray(str.count, bool, initialized = true);
+    if !filter.chunks return 0, highlights;
 
-    MAX_CHARS :: 200;
+    MAX_CHARS :: 400;
 
-    score: s32;
-    pos := 0;
-
-    for char : chars {
-        index := find_index_from_left_nocase(str, char, pos);
-        if index < 0 { score = -1; break; }
-        highlights[index] = true;
-        score += cast(s32) (MAX_CHARS - index);  // the closer to the beginning, the better
-        pos = index + char.count;
+    // Try matching the full string first and rank it the highest
+    {
+        index := find_index_from_left_nocase(str, filter.full_string, 0);
+        if index >= 0 {
+            memset(highlights.data + index, cast(u8) true, filter.full_string.count);
+            score := (400 + filter.full_string.count) * (MAX_CHARS - index);
+            return cast(s32) score, highlights, true;
+        }
     }
 
-    if score < 0 then memset(highlights.data, 0, highlights.count);  // no match -> no highlighting
+    score := 0;
 
-    return score, highlights;
+    auto_release_temp();
+    chunk_highlights := NewArray(str.count, bool, initialized = false,, allocator = temp);  // to store temporary highlights we might later reject
+
+    // Try matching each chunk exactly and accept the match if at least one matches
+    for chunk : filter.chunks {
+        chunk_score := 0;
+        memset(chunk_highlights.data, 0, chunk_highlights.count);
+
+        index := find_index_from_left_nocase(str, chunk.str, 0);
+        if index >= 0 {
+            memset(chunk_highlights.data + index, cast(u8) true, chunk.str.count);
+            chunk_score += (200 + chunk.str.count) * (MAX_CHARS - index) - str.count;
+        }
+
+        if chunk_score >= 0 {
+            score += chunk_score;
+            for i : 0 .. chunk_highlights.count - 1 { highlights[i] |= chunk_highlights[i]; }  // apply chunk highlights
+        }
+    }
+
+    if score > 0 return xx score, highlights, true;  // if we had at least one exact match, don't proceed
+    if score <= 0 && only_exact return xx score, highlights;
+
+    // Then match individual chars
+    for chunk : filter.chunks {
+        pos := 0;
+        chunk_score := 0;
+        memset(chunk_highlights.data, 0, chunk_highlights.count);
+
+        // Try matching the full chunk first
+        for char : chunk.chars {
+            index := find_index_from_left_nocase(str, char, pos);
+            if index < 0 { chunk_score = -1; break; }
+            chunk_highlights[index] = true;
+            chunk_score += 10 * (MAX_CHARS - index);  // the closer to the beginning, the better
+            pos = index + char.count;
+        }
+
+        if chunk_score >= 0 {
+            score += chunk_score;
+            for i : 0 .. chunk_highlights.count - 1 { highlights[i] |= chunk_highlights[i]; }  // apply chunk highlights
+        }
+    }
+
+    // if score <= 0 then memset(highlights.data, 0, highlights.count);  // no match -> no highlighting
+
+    return xx score, highlights;
+}
+
+construct_fuzzy_filter :: (filter_str: string, treat_slashes_as_spaces := false) -> Fuzzy_Filter {
+    str := copy_temporary_string(trim(filter_str));
+    if !str return .{};
+
+    chunks: [..] Fuzzy_Filter.Chunk;
+    chunks.allocator = temp;
+
+    // Split into strings separated by spaces or slashes
+    space := cast(u8) #char " ";
+    if treat_slashes_as_spaces then replace_chars(str, "\\/", space);
+    strings := split(str, space,, allocator = temp);
+
+    for s : strings {
+        if !s continue;
+
+        // Split the strings into individual chars
+        chars: [..] string;
+        chars.allocator = temp;
+        array_reserve(*chars, strings.count);
+
+        t := s.data;
+        while t < s.data + s.count {
+            substr: string = ---;
+            substr.data = t;
+            t = unicode_next_character(t);
+            substr.count = t - substr.data;
+            array_add(*chars, substr);
+        }
+
+        array_add(*chunks, Fuzzy_Filter.Chunk.{ str = s, chars = chars });
+    }
+
+    return Fuzzy_Filter.{ full_string = str, chunks = chunks };
 }
 
 bmh_prepare_skip_table :: (needle: string, case_sensitive: bool) -> [256] s32 {
@@ -224,17 +290,10 @@ find_index_from_left_nocase :: (s: string, substring: string, start_index := 0) 
 }
 
 match_whole_word :: (s: string, offset: int, count: int) -> bool {
-    before := <<cast(*u8) (s.data + offset - 1);
-    after  := <<cast(*u8) (s.data + offset + count);
-    first  := <<cast(*u8) (s.data + offset);
-    last   := <<cast(*u8) (s.data + offset + count - 1);
+    word_ends_on_the_left  := offset <= 0               || !is_word_char(s[offset - 1])     || !is_word_char(s[offset]);
+    word_ends_on_the_right := offset + count >= s.count || !is_word_char(s[offset + count]) || !is_word_char(s[offset + count - 1]);
 
-    b := (inline is_whitespace_char(before)) || (inline is_separator_char(before)) || offset - 1 < 0;
-    a := (inline is_whitespace_char(after))  || (inline is_separator_char(after))  || offset + count > s.count - 1;
-    f := (inline is_whitespace_char(first))  || (inline is_separator_char(first));
-    l := (inline is_whitespace_char(last))   || (inline is_separator_char(last));
-
-    return (f && l) || (f && !l && a) || (!f && l && b) || (!f && !l && b && a);
+    return word_ends_on_the_left && word_ends_on_the_right;
 }
 
 #add_context underscore_is_part_of_word := true;
@@ -354,11 +413,11 @@ start_animation :: (anim: *Tween_Animation(T), start: $T, target: T, speed: Time
 
     // Pretend the animation started last frame so we start moving right away.
     // If the current frame was t=0, then the movement would simply be delayed one frame.
-    anim.started_at = frame_time - frame_dt;
+    anim.started_at = frame_time - to_apollo(frame_dt);
 }
 
 get_animation_value :: (using anim: Tween_Animation($T)) -> T {
-    t := cast(float) ((frame_time - started_at) / speed);
+    t := (to_float64_seconds(frame_time - started_at) / speed);
     t = clamp(t, 0, 1);
     if #complete func == {
         case .lerp;       return start + cast(T) (cast(float)(target - start) * t);
@@ -414,11 +473,10 @@ ends_with :: inline (s: string, ch: u8) -> bool {
 
 // a version of `split()` from the `String` module that returns an array with a maximum
 // number of elements
-split :: (s: string, separator: $T, max_splits: int, allocator := temp) -> [] string {
+split :: (s: string, separator: $T, max_splits: int) -> [] string {
     #assert (T == u8) || (T == string);
 
     results: [..] string;
-    results.allocator = allocator;
 
     if max_splits < 1 return results;
 
@@ -447,8 +505,8 @@ split :: (s: string, separator: $T, max_splits: int, allocator := temp) -> [] st
 
 Tween_Animation :: struct(T: Type) {
     start, target: T;
-    started_at: Time;
-    speed: Time = xx 0.1;  // how many seconds to finish
+    started_at: Apollo_Time;
+    speed : Time = xx 0.1;  // how many seconds to finish
     func: enum { lerp; smoothstep; } = .smoothstep;
 }
 
@@ -458,4 +516,14 @@ Char_Type :: enum {
     non_word;
     space;
     other;
+}
+
+Fuzzy_Filter :: struct {
+    full_string: string;
+    chunks: [] Chunk;
+
+    Chunk :: struct {
+        str: string;
+        chars: [] string;
+    }
 }
